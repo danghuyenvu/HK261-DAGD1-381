@@ -29,7 +29,7 @@ Status: DRAFT for review and audit. Scope is flexible; every module carries a ta
 | Input | Format | Provides | Does not provide | Tag |
 |---|---|---|---|---|
 | OpenAPI document | JSON/YAML | Operations, schemas, params, security schemes/scopes, declared success and error responses, examples, `readOnly`/`writeOnly`, `additionalProperties` | Roles, ownership, business rules, forbidden transitions | CORE |
-| HAR traffic | `.har` files, or passive proxy capture during manual interaction | Valid real sequences, ID flow between requests, per-session identity, observed status/field changes, hidden preconditions satisfied in practice | Anything the operator did not exercise | CORE |
+| HAR traffic | `.har` files or Burp exports, captured with external tools (Burp, ZAP, DevTools) during manual interaction | Valid real sequences, ID flow between requests, per-session identity, observed status/field changes, hidden preconditions satisfied in practice | Anything the operator did not exercise | CORE |
 | Environment inventory | *Proposed redefinition* (see below) | Actors, in-scope hosts, optional declared seed objects | Policy, state rules | CORE (minimal) |
 | HAR from frontend replay (capture assistant) | HAR 1.2; optionally with underscore-prefixed extension fields (`_actor`, `_fieldAccess`) | Extra valid sequences per actor UI (more coverage); with the extension, the allowed field set per actor/route | Authorization truth; reading is not displaying | CORE (replay needs a live app; a plain HAR is still accepted) |
 | Database read adapter | Read-only connection | Before/after state readback; objects that cannot be created via API | Policy | OPTIONAL |
@@ -50,7 +50,8 @@ seed_objects: []  # optional, declared only
 ```
 
 Open question Q1: where does actor identity come from: inventory, one HAR per actor, or both?
--> Inventory, input HAR is not expected to fully cover the identities, but rather from inventories including sessions, and their related attribute (this should be trusted).
+
+**Resolved:** from the inventory. It lists identifiers per actor that the importer matches against HAR entries (tokens are decoded in memory and never persisted). HAR need not cover every actor: the tool logs in itself from the credential source. Fallback: one actor per HAR file. See `architecture.md` 4.2.
 
 #### P1 (PENDING supervisor decision): state-restoration feature
 
@@ -274,7 +275,7 @@ Every mutating probe runs on a freshly reset snapshot.
 ### [G] Gateway [CORE]
 Host/path/method allowlist, action allowlist, request cap, rate/concurrency budget, dry-run, kill switch, audit log. Gateway allowlists control *forwarding*, never oracle expectations.
 
-- **Direction rule.** Every *outbound* request (browser, crawler, or system-generated) is checked against scope. *Inbound* responses are passed, not scope-checked (size/time caps and redaction still apply). A redirect response is passed, but its next hop is a new outbound request and is checked again.
+- **Direction rule.** Every *outbound* request (crawler or system-generated; human capture in external tools is outside the gateway) is checked against scope. *Inbound* responses are passed, not scope-checked (size/time caps and redaction still apply). A redirect response is passed, but its next hop is a new outbound request and is checked again.
 - **Blocked requests are recorded.** A blocked request is never forwarded; the caller gets an immediate gateway-marked response, and the event is stored with `gateway_verdict=blocked` and a reason. See `architecture.md`.
 - **Undocumented paths (shadow-API handling).** An in-scope host with a path or method absent from the OpenAPI document is governed by an explicit config key `undocumented_policy` (`block`; `hold` = forward only if a pre-approved pattern matches, else block; `allow_and_flag`) that must be set before a run starts; a run with it unset refuses to start.
 
@@ -507,3 +508,4 @@ Design points agreed in discussion but not yet written into the sections above. 
 - `identity_risk` probe class (probes that touch role, tenant, owner or permission fields) in addition to the operation-level `session_affecting` tag; post-probe identity check; taint tracking in run state; `identity_risk_mode: twin | last_with_taint | disabled`; an identity change after a probe is itself a finding.
 - Benchmark runs still reset every configuration to the same initial state for fair comparison.
 - With a state-restoration trigger (P1), the per-test flow is: restore, plant fresh objects, probe, read back; restoration success is verified through the API, and restored accounts are re-checked for liveness.
+- Manual capture happens on the freshly seeded state; afterwards the state is restored (P1), or the run records in `isolation_mode` that it starts from a post-capture state.

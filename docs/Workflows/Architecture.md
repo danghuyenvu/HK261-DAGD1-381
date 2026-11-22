@@ -11,30 +11,31 @@ Companion to `workflow.md`. This document fixes module boundaries, interfaces, t
 | 1 | `store` | events, models, findings | SQLite database; JSONL/HAR export | none | CORE |
 | 2 | `spec_loader` | OpenAPI document | normalized operations (`operation_id`, route template, params, schemas, servers, security) | none | CORE |
 | 3 | `allowlist` (builder) | normalized operations + `config/gateway.yaml` | `allowlist.generated.json` (versioned, hashed) | 2 | CORE |
-| 4 | `gateway` (policy engine) | request/response objects, allowlist, config | verdicts (`forwarded`, `blocked`, `dry_run`, `tunneled`), audit events | 3, 1 | CORE |
-| 5 | `proxy` (mitmproxy addon) | network traffic | decoded flows passed to the gateway; stored events; HAR export | 4, 1 | CORE |
+| 4 | `gateway` (policy engine) | request/response objects, allowlist, config | verdicts (`forwarded`, `blocked`, `dry_run`), audit events | 3, 1 | CORE |
+| 5 | `proxy` (normalizer; transport reserved for future work) | raw requests from producers (DSL executor, crawler) | canonical `GatewayRequest` with raw-body hash and fingerprint | `common` | CORE |
 | 6 | `control_api` + minimal UI | store, gateway state | findings review queue, kill switch (interactive approvals deferred) | 1, 4 | CORE |
-| 7 | `capture` (crawler, Playwright) | actor session, scope | HAR with `_actor`/`_fieldAccess` extension | 5 | CORE (later) |
+| 7 | `capture` (crawler, Playwright) | actor session, scope | HAR with `_actor`/`_fieldAccess` extension | 4, 5, 11 | CORE (later) |
 | 8 | `spec_analyzer` | normalized operations | dependency graph, flows, field classification | 2 | CORE (later) |
 | 9 | `inference`, `oracle`, `probe generation` | per `workflow.md` | per `workflow.md` | 1, 4, 8 | CORE (later) |
 | 10 | `pipeline` (orchestrator) | config, run context, stage registry | run records, stage results, run folder | all stages | CORE (thin first) |
+| 11 | `client` (GatewayClient) | `GatewayRequest` | response; write-ahead and response events; the only HTTP client in the codebase | 4, 5, 1 | CORE |
+| 12 | `ingest` (HAR, Burp adapters) | HAR / Burp export files + inventory | events with `origin=import` | 5, 1 | CORE |
 
 Rule: the tool's code never imports from `lab-apps/` and never reads lab policy or ground-truth files (leakage rule).
 
-Suggested build order: 1, 2, 3, 4, 5, 6, 7, 8. The `pipeline` runner starts thin after the gateway (step 4) and grows as stages land.
+Suggested build order: 1, 2, 3, 4, 5, 11, 12, 6, 7, 8. The `pipeline` runner starts thin after the gateway (step 4) and grows as stages land.
 
 ---
 
 ## 2. Engine interface (transport-agnostic)
 
-The gateway engine has no network code and no TLS fields. mitmproxy terminates TLS before the addon runs, so everything downstream sees decoded requests.
+The gateway engine has no network code and no TLS fields. The normalizer (2.1) produces a canonical request object, and the gateway client (2.2) originates every request as a TLS client, so the engine only ever sees canonical, decoded requests.
 
 ```python
 @dataclass
 class GatewayRequest:
     run_id: str
-    mode: Literal["capture", "test"]
-    actor: str | None          # from listener port (capture) or caller (test)
+    actor: str | None          # from the caller (DSL executor or crawler session)
     method: str
     scheme: str                # informational only
     host: str
@@ -43,24 +44,47 @@ class GatewayRequest:
     query: str
     headers: dict[str, str]
     body: bytes
-    origin: Literal["browser", "crawler", "system"]   # who generated it
+    origin: Literal["crawler", "system"]   # who generated it (imports are never fired)
 
 @dataclass
 class Verdict:
-    decision: Literal["forwarded", "blocked", "dry_run", "tunneled"]
+    decision: Literal["forwarded", "blocked", "dry_run"]
     reason: str                # e.g. "out_of_scope_host", "not_in_allowlist",
                                # "undocumented_path", "budget_exceeded", "kill_switch"
     rule_id: str | None
     allowlist_hash: str
 ```
 
-`decide(request) -> Verdict` is a pure function over (request, allowlist, config, counters). The proxy adapter applies the verdict; the engine does not forward anything itself.
+`decide(request) -> Verdict` is a pure function over (request, allowlist, config, counters). The gateway client applies the verdict; the engine does not forward anything itself.
+
+### 2.1 Normalizer (`src/proxy/normalizer.py`)
+
+A pure function from a raw request to a canonical `GatewayRequest`. It does syntax only and fails closed; it makes no allowlist decisions (resolving a route template to an operation stays inside the gateway's rule lookup).
+
+- **Canonicalization:** lowercase scheme and host, strip the default port, reject userinfo; uppercase the method; lowercase header names; reject conflicting `Content-Length` and `Transfer-Encoding`.
+- **Path rules:** reject dot segments, encoded variants, null bytes and control characters instead of silently rewriting them. Matching an allowlist against a non-canonical path is a bypass. The result is a `blocked` event with reason `non_canonical`.
+- **Hashes:** the raw-body hash and the canonical fingerprint are computed here, before any redaction.
+- **Producers:** the DSL executor, the crawler, and the importers (imports use it for canonical form and hashing, never for firing).
+
+### 2.2 Gateway client (`src/client/gateway_client.py`)
+
+The only HTTP client in the codebase, with a fixed in-scope base URL. Flow per request:
+
+1. normalize, then `decide()`;
+2. on `forwarded`, the gateway returns an **admission token**;
+3. write-ahead commit of the request-side event (6.2);
+4. fire the request as a TLS client to the upstream; the firing function accepts only a request carrying an admission token;
+5. commit the response side, then return the response.
+
+Rules: no automatic redirects (each hop re-enters step 1); after building the outgoing request, assert that the prepared URL equals the canonical one, because some HTTP libraries re-encode URLs; a boundary test fails if any module outside `src/client/` imports `requests`, `httpx` or `urllib`.
+
+**Reserved proxy slot.** A future transport proxy would be one more producer of `GatewayRequest` in front of the normalizer. TLS termination returns to scope only if that proxy is built.
 
 ---
 
 ## 3. Gateway rules
 
-**Direction.** Every outbound request is checked, regardless of who generated it (browser, crawler, or system). Inbound responses are passed without scope checks; the following still apply to them: size and time caps, decompression limits, redaction before storage, and treating content as untrusted data (relevant to Phase 2 prompt-injection risk).
+**Direction.** Every outbound request is checked, regardless of who generated it (crawler or system; human capture in external tools is outside the gateway, see below). Inbound responses are passed without scope checks; the following still apply to them: size and time caps, decompression limits, redaction before storage, and treating content as untrusted data (relevant to Phase 2 prompt-injection risk).
 
 **Redirects.** A 3xx response is passed, but each next hop is a new outbound request and re-enters `decide()`. No client (RunTrace, replay harness, Playwright) follows redirects by itself.
 
@@ -72,7 +96,7 @@ class Verdict:
 
 **Gateway verdicts are not target verdicts.** The oracle ignores events whose `gateway_verdict` is not `forwarded`, and coverage and detection metrics exclude them. A gateway-generated 403 must never be read as an application deny (D3).
 
-**Out-of-scope hosts.** Default: `block`, in both modes. A host named explicitly in config under `pass_hosts` is tunneled uninspected (TLS not terminated, content not stored; a `tunneled` event records host and byte counts). No wildcards.
+**Out-of-scope hosts.** Default: `block`. The tool never contacts an out-of-scope host: there is no pass-through, because the gateway originates every request itself. (A `pass_hosts` list would return only if the reserved proxy is built.)
 
 **Undocumented paths (shadow-API handling).** An in-scope host with a path or method absent from the OpenAPI document is controlled by `undocumented_policy`:
 
@@ -82,43 +106,53 @@ class Verdict:
 | `hold` | forwarded only if the request matches a pre-approved pattern in config (reason `pre_approved`); otherwise blocked. Event stored either way. No interactive approval in the first iteration |
 | `allow_and_flag` | forwarded and flagged `undocumented` for model review |
 
-The key has **no default**. A run with it unset refuses to start. Static assets (non-API GETs on the in-scope host) can be allowed by an explicit path-class rule in capture mode and are logged as `static`.
+The key has **no default**. A run with it unset refuses to start. Static assets (non-API GETs on the in-scope host) can be allowed by an explicit path-class rule for the crawler and are logged as `static`.
 
 **Other checks:** per-run request cap, rate and concurrency budget, dry-run, kill switch, destructiveness approval gate (tags from `workflow.md` [C2.4]; before tags exist, writes are allowed only if they match a pre-approved pattern; the rest are blocked), full audit log.
 
-**Out of the gateway's reach.** Requests the target makes on its own (SSRF, webhooks) never pass the gateway. Control them with lab network isolation and egress rules (Docker network, OPNsense), and record this in the threat model.
+**Out of the gateway's reach.** Requests the target makes on its own (SSRF, webhooks) never pass the gateway. Control them with lab network isolation and egress rules (Docker network, OPNsense), and record this in the threat model. Manual capture in external tools (Burp, ZAP, DevTools) likewise never passes the gateway. The KPI is therefore "100% of tool-sent requests pass the gateway; zero reach the upstream outside the allowlist", assuming manual capture is done by an authorized person against the lab and is bounded by the external tool's own scope settings.
 
 ---
 
-## 4. Proxy modes
+## 4. Capture and ingestion
 
-| | Capture mode | Test mode |
+| Source | How it enters | Gateway |
 |---|---|---|
-| Proxy type | forward (explicit) proxy, browser points at it | reverse proxy, fixed upstream |
-| Driver | human browsing, or crawler | RunTrace, probes, replay |
-| Listener | one port per actor, one browser profile per actor | caller supplies actor |
-| Policy | scope-based, `undocumented_policy` applies | strict spec-derived allowlist plus budgets |
-| Output | events in store, HAR export | events in store |
+| Human browsing, recorded in Burp, ZAP or DevTools | exported file, ingested through an adapter | not involved; stored as `origin=import`, verdict `imported` |
+| Crawler (Playwright) | fired through the gateway client; emits HAR plus `_actor`/`_fieldAccess` extension fields | enforcement policy is unresolved (A9) |
+| Tool-sent test traffic (DSL executor, probes, replay) | gateway client | full enforcement |
 
-**Actor listeners.** In capture mode each actor gets its own listener port, allocated dynamically at run start. A launcher creates a browser profile configured with that port and records the mapping in `actor_sessions`. The port gives the `_actor` label. In test mode the caller supplies the actor.
+### 4.1 Ingest adapters (`src/ingest/`)
 
-**Import mode (HAR ingestion).** mitmproxy can read external HAR files (verify against the installed version), so DevTools or Burp HARs can be loaded through the same flow path. Imported entries are historical: they are not forwarded to the target and do not count as gateway-forwarded requests. They get `origin = import`, `gateway_verdict = imported`, a source-file reference, and a user-supplied actor; they pass through redaction before storage and are excluded from oracle verdicts and the forwarding/safety KPIs. They still count toward HAR coverage and model inference. The `_actor` and `_fieldAccess` extension fields may not survive mitmproxy's own import/export, so test the round trip.
+- **Interface:** each adapter is a pure parser from one format to a common record, `ImportedExchange` (method, URL, raw request, raw response, timestamp if present). A shared stage then computes the raw-body hash, redacts, attaches the actor, and stores the event with `origin=import`.
+- **Adapters:** `har` first, then `burp_xml`; ZAP can be added later without touching the shared stage. The format is detected by content sniffing; unknown formats are rejected.
+- **Missing fields:** an adapter leaves fields it cannot fill as NULL (HAR has browser timings, Burp preserves raw bytes).
+- **Hardening:** imports are untrusted. Apply size limits, no execution, and `defusedxml` (or equivalent) for XML to avoid entity expansion and XXE. Never treat an import as policy truth.
+- **KPIs:** imported events are excluded from oracle verdicts and from the forwarding and safety KPIs (DR9). They still count toward HAR coverage and model inference.
+
+### 4.2 Actor attribution
+
+Actor identity comes from the inventory (`workflow.md` Q1). The inventory lists identifiers per actor (for example username, user ID, or the JWT `sub` claim); the importer decodes tokens in memory only and never persists them. Entries that match no actor get `unknown` and are excluded from actor-specific inference. HAR is not expected to cover every actor: the tool logs in itself from the credential source in the inventory (an `auth`-class operation). Fallback: one actor per HAR file.
+
+### 4.3 Ordering
+
+Manual browsing mutates the application. Capture on the freshly seeded state, then restore, or record in `isolation_mode` that the tool starts from a post-capture state, so the first probes do not run against whatever the human did.
 
 ---
 
 ## 5. TLS handling (target runs HTTPS)
 
-- mitmproxy generates a local CA; install it in each actor's browser profile. Keep the CA key out of the repository; the CA is lab-only.
-- The lab's upstream certificate may be self-signed (verify against the actual crAPI setup). Prefer trusting that certificate explicitly. If upstream verification must be disabled, restrict the relaxation to the in-scope lab host in config so it cannot apply to another target.
-- Intercept only in-scope hosts.
-- Compute the raw-body hash before redaction; store only redacted content. Cover this ordering with a test, since interception exposes real tokens and cookies.
-- Plain HTTP port, if the lab offers one, may be used for early tests; TLS is still completed in Phase 1.
+- The gateway client is the only TLS endpoint and acts as a TLS **client** to the in-scope upstream. Nothing terminates TLS and there is no CA to install. Termination returns only if the reserved proxy is built.
+- The lab's upstream certificate may be self-signed (A3). Trust it explicitly through `tls.upstream_trust`. If verification must be disabled, restrict the relaxation to the in-scope lab host in config so it cannot apply to another target.
+- Compute the raw-body hash in the normalizer before redaction and store only redacted content. Cover this ordering with a test.
+- Crawler: depending on the outcome of A9, either the browser never speaks TLS to the target (requests are fulfilled by the gateway client), or the lab profile must trust the lab certificate for the in-scope host only.
+- A plain-HTTP port, if the lab offers one, may be used for early tests; TLS is still completed in Phase 1.
 
 ---
 
 ## 6. Store (SQLite)
 
-Separate database file from the target's database. The lab reset replaces target collections and must never touch evidence. WAL mode for concurrent proxy writes and UI reads. Events are append-only.
+Separate database file from the target's database. The lab reset replaces target collections and must never touch evidence. WAL mode for concurrent gateway writes and UI reads. Events are append-only.
 
 ```sql
 CREATE TABLE schema_version (version INTEGER NOT NULL, applied_at TEXT);
@@ -133,7 +167,7 @@ CREATE TABLE runs (
 
 CREATE TABLE actor_sessions (
   run_id TEXT REFERENCES runs(run_id), actor TEXT,
-  listener_port INTEGER, profile_path TEXT,
+  credential_source TEXT, profile_path TEXT,   -- labels only, never a token
   PRIMARY KEY (run_id, actor)
 );
 
@@ -142,17 +176,18 @@ CREATE TABLE events (
   -- insertion order within a run is the table's implicit rowid
   run_id TEXT REFERENCES runs(run_id),
   workflow_id TEXT, sequence_id TEXT, step_idx INTEGER,
-  ts TEXT, origin TEXT,               -- browser | crawler | system | import
+  ts TEXT, origin TEXT,               -- crawler | system | import
   actor TEXT, operation_id TEXT,      -- operation_id null if undocumented
   method TEXT, host TEXT, path TEXT, query TEXT,
-  gateway_verdict TEXT,               -- forwarded | blocked | dry_run | tunneled | imported
+  gateway_verdict TEXT,               -- forwarded | blocked | dry_run | imported
   gateway_reason TEXT, rule_id TEXT,
   valid_request INTEGER,
   request_redacted TEXT,               -- JSON, size-capped
   raw_body_hash TEXT,                 -- hash of unredacted request body
   request_fingerprint TEXT,           -- canonical method/path/query/header/body
   normalization_version TEXT,
-  case_id TEXT, tag TEXT, undocumented INTEGER DEFAULT 0
+  case_id TEXT, tag TEXT, undocumented INTEGER DEFAULT 0,
+  source_file TEXT                    -- set for imports
 );
 CREATE INDEX ev_run ON events(run_id, step_idx);
 CREATE INDEX ev_actor_op ON events(actor, operation_id);
@@ -195,7 +230,7 @@ Methods (add only when a module needs one; no generic `query(sql)`):
 Rules:
 1. Callers assign `event_id`; `append_event` is idempotent on it (`INSERT OR IGNORE`).
 2. Events and model versions are append-only; `put_model` raises if the version exists.
-3. The store receives only redacted events. The raw-body hash is computed before redaction, and that order is enforced at the proxy boundary, not in the adapter.
+3. The store receives only redacted events. The raw-body hash is computed before redaction, and that order is enforced in the normalizer and at the gateway client boundary, not in the adapter.
 4. WAL mode and a busy timeout are on. Writes go through `StoreWriter` (6.2): one writer thread, group commit, callers released after commit.
 5. Timestamps are ISO UTC strings; body fields are size-capped; no ORM; parameterized SQL only.
 6. Events come back in insertion order within a run.
@@ -204,7 +239,7 @@ Tests use a temp file or `:memory:` database and cover idempotent append, atomic
 
 ### 6.2 StoreWriter (durable write path)
 
-`StoreWriter` wraps `Store` for the proxy and gateway. It is the only writer, and it gives callers a durability guarantee instead of a fire-and-forget queue. Kafka and a journal file were considered and not adopted (DR12).
+`StoreWriter` wraps `Store` for the gateway client. It is the only writer, and it gives callers a durability guarantee instead of a fire-and-forget queue. Kafka and a journal file were considered and not adopted (DR12).
 
 **Rule: nothing a caller has seen may exist without a durable record.** The wait for a commit is unavoidable; group commit keeps it to milliseconds.
 
@@ -239,9 +274,9 @@ Nothing is dropped. `dropped` stays 0 by construction.
 
 **Durability level.** The target is process-crash safety: WAL with `synchronous=NORMAL`. The setting is a config key; use `FULL` if power-loss safety is required later.
 
-**Async proxy.** mitmproxy's addon runs on an asyncio loop. The addon awaits the write futures and never calls a blocking queue operation. The writer thread resolves futures with `loop.call_soon_threadsafe`.
+**Async callers.** The gateway client and the crawler's route handler run on asyncio loops. They await the write futures and never call a blocking queue operation. The writer thread resolves futures with `loop.call_soon_threadsafe`.
 
-**Reads.** Reads do not use the writer. Each reader has its own read-only connection (small pool) with a query timeout. Because the oracle reads events the proxy has just written, the pipeline calls `flush()` before evaluating a probe's results.
+**Reads.** Reads do not use the writer. Each reader has its own read-only connection (small pool) with a query timeout. Because the oracle reads events the gateway has just written, the pipeline calls `flush()` before evaluating a probe's results.
 
 **Shutdown and kill switch.** Stop forwarding first, then drain with a timeout, then close. A kill switch that skips the drain loses the last events.
 
@@ -257,7 +292,6 @@ Nothing is dropped. `dropped` stays 0 by construction.
 scope:
   in_scope_hosts: ["localhost:8443"]
   out_of_scope_default: block
-  pass_hosts: []                    # explicit hosts tunneled uninspected; no wildcards
 undocumented_policy: null           # REQUIRED: block | hold | allow_and_flag
 approved_patterns: []              # pre-approved requests for `hold` and for writes before tags exist
                                    # e.g. {method: POST, path: "/api/v1/orders", actor: user_a}
@@ -273,6 +307,8 @@ destructiveness:
 tls:
   upstream_trust: "config/<target>/certs/lab-upstream.pem"   # preferred over disabling verification
 dry_run: false
+crawler:
+  gateway_mode: null             # UNRESOLVED (A9): fulfill | decide_continue
 logging:
   level: INFO                       # DEBUG adds detail but is still redacted
   max_bytes_per_file: 10485760      # size-based rotation within a run
@@ -295,17 +331,17 @@ store:
 
 **DR1: SQLite for events and models.** Concurrent proxy writes and UI reads, cross-run queries, Phase 2 aggregates over 10+ seeds. No server needed; one file ships in the reproducibility package. Access goes through a narrow `Store` adapter (section 6.1), so a backend change means rewriting only the adapter. Cost of reversing: low (JSONL/HAR export retained). Rejected: JSON files (whole-file rewrites, concurrency), Postgres/Mongo (overkill now).
 
-**DR2: mitmproxy as the proxy engine.** Python, forward and reverse modes, addon API, TLS interception, intercept/hold, existing web UI. Reduces custom work to the gateway addon, actor labeling, the store writer, and the review UI. Verify HAR import/export and the extension-field round trip before committing. Rejected: ZAP (Java), Burp (closed), writing a proxy from scratch.
+**DR2 (SUPERSEDED by DR13): mitmproxy as the proxy engine.** Dropped because the proxy is not core and the gateway originates requests itself. Remains the preferred engine if a transport proxy is built later (Python, addon API, TLS interception).
 
-**DR3: Gateway engine separate from the proxy adapter.** Pure policy function, unit-testable, shared by capture mode, test mode, crawler, and RunTrace. Supports the KPI "100% of requests through the gateway" in every path.
+**DR3: Gateway engine separate from the proxy adapter.** Pure policy function, unit-testable, shared by the crawler, the DSL executor, and RunTrace. Supports the KPI "100% of requests through the gateway" in every path.
 
-**DR4: Two proxy modes (forward capture, reverse test).** Human browsing needs a forward proxy; automated runs benefit from a fixed upstream that callers cannot override.
+**DR4 (SUPERSEDED by DR13): two proxy modes (forward capture, reverse test).** Human capture moved to external tools; tool-sent traffic uses a fixed upstream in the gateway client.
 
 **DR5: Direction-based scope with explicit gateway verdict.** Outbound checked, inbound passed; blocked requests recorded with their own verdict so the oracle cannot mistake them for application denies.
 
 **DR6: No default for `undocumented_policy`.** Shadow-API handling is a deliberate per-run decision, not an implicit default.
 
-**DR7: TLS terminated in the proxy adapter only.** Core modules see decoded requests; trust of the lab upstream is explicit and host-scoped.
+**DR7 (SUPERSEDED by DR13): TLS terminated in the proxy adapter only.** Replaced: the gateway client is the only TLS endpoint, as a client; trust of the lab upstream stays explicit and host-scoped.
 
 **DR8: Spec parsing split.** A thin `spec_loader` first (needed by the allowlist builder); the heavy analyzer later on top of it.
 
@@ -315,22 +351,26 @@ store:
 
 **DR12: Durable group-commit writer; no Kafka, no journal (for now).** Callers are released only after their batch commits, with a write-ahead request record before forwarding. This meets the no-loss requirement for process crashes with no extra component. Kafka was rejected because its durable acknowledgement costs the same wait as a local commit, it adds a broker to deploy and ship, and the load does not need it. A journal file is the next step only if benchmarks show SQLite stalls. Both can replace the writer behind the `StoreWriter` interface later.
 
+**DR13: No proxy transport in the first iteration; normalizer plus gateway client.** The proxy module is reduced to a normalizer (pure, syntax-only, fail-closed) in front of the gateway. The gateway client originates every request as a TLS client, so enforcement stays in one place. Human capture is done in external tools (Burp, ZAP, DevTools) and ingested through adapters. The proxy slot is reserved: a transport adapter would only be another producer of `GatewayRequest`. Accepted consequences: enforcement is in-process (mitigated by the HTTP-import boundary test and lab egress rules), the KPI is scoped to tool-sent requests, crawler enforcement is an open decision (A9), and actor labels come from the inventory. Cost of reversing: low.
+
 ---
 
 ## 9. Open questions
 
 **Resolved**
 - Held requests are approved only by pre-configured patterns (DR10).
-- Out-of-scope default is `block`; named hosts may be passed (tunneled).
-- Actor listener ports are allocated dynamically, recorded in `actor_sessions`.
-- mitmproxy can import external HAR files (verify version support); imports are ingestion (DR9).
+- Out-of-scope default is `block`; there is no pass-through (DR13).
+- Human capture happens in external tools and is ingested through adapters (DR13); no listeners, no CA, no `tunneled` events.
+- Actor identity comes from the inventory; HAR need not cover every actor (4.2).
 
 **Open**
 - A3. Does crAPI's compose use a self-signed certificate, and does it also expose a plain-HTTP port? (to be checked on the range)
-- A4. Is a custom HAR exporter needed? Decide after testing whether the extension fields survive mitmproxy's import/export; the store is the source of truth either way.
 - A6. Granularity of `approved_patterns` (method + path template + actor?), and whether wildcards in path templates are allowed.
-- A7. Are `tunneled` events logged (host and byte counts only), or not logged at all?
-- A8. Imported HARs that mix several users in one file: is one actor label per file enough, or must the import accept a mapping from token/cookie to actor?
+- A8. Which identifiers per actor does the inventory carry for HAR attribution (username, user ID, JWT `sub`), and how are conflicts resolved?
+- A9. **UNRESOLVED: crawler enforcement policy.** Two options, to be decided after a spike against crAPI:
+  - **Option A, fulfill through the gateway.** A Playwright route handler normalizes each browser request, the gateway client fires it, and the handler fulfills the browser's request with the response. Full enforcement and write-ahead semantics (the response is committed before the browser sees it). Risks: cookies and `Set-Cookie` round trips, redirects (must come back as 3xx so each hop re-enters the gateway), CORS preflights, service workers, WebSockets and streaming.
+  - **Option B, decide and continue.** The gateway only decides and the browser sends the request; the response is recorded from events. Breaks fewer pages, but the browser sends after the check, the response is seen before it is committed, and the sent request can differ from the checked one. It needs an explicit note in the threat model that enforcement is weaker for crawler traffic.
+- A10. Export fidelity: test one export each from Burp, ZAP and DevTools. DevTools may sanitize sensitive headers by default, which would remove the headers needed to tell actors apart; verify the Burp export format and its body encoding before writing its adapter.
 
 ---
 
@@ -402,19 +442,22 @@ repo/
 │   ├── gateway/                     # pure policy engine, no network code                       [NOW]
 │   │   ├── engine.py                #   decide(request) -> Verdict
 │   │   ├── rules.py  budgets.py  audit.py  kill_switch.py
-│   ├── proxy/                       # mitmproxy adapter                                         [NOW]
-│   │   ├── addon.py                 #   calls the gateway, writes events via a queue
-│   │   ├── modes.py                 #   capture (forward) / test (reverse)
-│   │   ├── actors.py                #   dynamic listener allocation, actor_sessions
-│   │   ├── har_import.py            #   origin=import, verdict=imported
-│   │   └── har_export.py            #   only if extension fields do not round-trip
+│   ├── proxy/                       # reserved transport slot; normalizer only for now          [NOW]
+│   │   ├── normalizer.py            #   raw request -> canonical GatewayRequest + hashes (pure, syntax only)
+│   │   └── README.md                #   states that transport adapters (e.g. mitmproxy) are reserved
+│   ├── client/                      # GatewayClient: the only HTTP client; TLS client to the in-scope upstream  [NOW]
+│   │   └── gateway_client.py        #   normalize -> decide -> admission -> write-ahead -> fire -> response commit
+│   ├── ingest/                      # import adapters: external traffic -> events (origin=import)  [NOW]
+│   │   ├── base.py                  #   ImportedExchange + shared stage (hash, redact, actor, store)
+│   │   ├── har.py                   #   HAR 1.2 adapter
+│   │   └── burp_xml.py              #   Burp export adapter (defusedxml)
 │   ├── restoration/                 # optional trigger runner (P1)                              [PENDING]
 │   │   └── runner.py
 │   ├── control/                     # FastAPI control API + minimal UI                          [LATER]
 │   │   ├── api.py   (findings queue, kill switch)
 │   │   └── ui/
 │   ├── capture/                     # crawler as HAR capture assistant                          [LATER]
-│   │   ├── launcher.py              #   browser profile per actor, pointed at its listener port
+│   │   ├── launcher.py              #   browser profile per actor (session from inventory credentials)
 │   │   ├── crawler.py
 │   │   └── field_access.js          #   init script recording which JSON properties the page reads
 │   ├── inference/                   # GET-first classification, footprints, tags, exposure     [LATER]
@@ -428,14 +471,13 @@ repo/
 │   └── metrics.py                   #   coverage, precision/recall, planting coverage
 │
 ├── tests/
-│   ├── test_boundaries.py           # fails if src/ imports lab-apps/ or eval/                  [NOW]
-│   ├── store/  common/  allowlist/  gateway/  proxy/                                            [NOW]
+│   ├── test_boundaries.py           # fails if src/ imports lab-apps/ or eval/, or if anything outside src/client/ imports an HTTP library                  [NOW]
+│   ├── store/  common/  allowlist/  gateway/  proxy/  client/  ingest/                                            [NOW]
 │   └── test_custom_cases.py         # (existing) lab-app ground-truth replay; consider tests/lab/
 │
 ├── runs/                            # gitignored: tool outputs, kept separate from the target systems
 │   └── <target>/
 │       ├── store.db                 # SQLite; one database per target, runs table inside
-│       ├── ca/                      # generated proxy CA, reused across runs so browser profiles trust it once
 │       ├── logs/                    # system debug logs of the most recent run only (see 11.1)
 │       │   ├── run_id.txt           #   which run these logs belong to
 │       │   └── proxy.log  gateway.log  store.log  ...   # one file per component
@@ -480,12 +522,12 @@ Notes
 - Stages never call each other. They are decoupled through the store and files, so each is runnable and testable alone, and checkpoint/resume becomes possible later.
 - The stages correspond to `workflow.md` [A] to [K].
 
-### 12.2 Two kinds of commands
+### 12.2 Kinds of commands
 
 | Kind | Examples | Notes |
 |---|---|---|
-| Services | `proxy` (capture or test mode) | Long-running and interactive; a human browses through it, so it is not a batch stage |
-| Stages | `build-allowlist`, `import-har`, later `infer`, `plant`, `freeze`, `calibrate`, `probe`, `evaluate` | Run to completion |
+| Services | none in the first iteration | A transport `proxy` is reserved (DR13); if built, it would be the only long-running, interactive command |
+| Stages | `build-allowlist`, `import-har` (and later `import-burp`), later `crawl`, `infer`, `plant`, `freeze`, `calibrate`, `probe`, `evaluate` | Run to completion; human capture happens outside the tool, in Burp, ZAP or DevTools |
 
 `run` composes stages in order, with `--from` and `--to` for partial runs. Every stage accepts `--target` and `--dry-run`. Subcommands are added as their modules land; `run` is added once two or more stages are worth chaining.
 
@@ -505,3 +547,4 @@ Starting a run is therefore not a side effect of `Store.create_run`; the store n
 - One smoke test calls `main([...])` with `--dry-run`, needing no network, to cover the CLI wiring.
 - Later, an end-to-end test runs against the custom mock lab app with fixture spec and HAR.
 - The leakage rule applies: `cli.py` and `pipeline/` must not import `lab-apps/` or `eval/`; `tests/test_boundaries.py` checks it.
+- Dependencies: `mitmproxy` is removed from `pyproject.toml` until a transport proxy is built; `defusedxml` is added for the Burp adapter.
